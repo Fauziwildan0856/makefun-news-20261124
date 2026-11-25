@@ -1,78 +1,97 @@
 #!/usr/bin/env python3
-"""Publisher for the v16 entry to make.fun's news-image-20261124.
+"""Publisher for the news-image-20261124 entry.
 
-The deliverable is a single picture: entry.png, stored next to this
-file, a 1024x1024 broadsheet page that sums up the world news of
-Tuesday 24 November 2026. Running this program copies that picture
-into the output directory as entry.png — but only once the stored
-file's SHA-256 digest matches the digest recorded below, so a
-damaged or swapped image is turned away instead of published.
+The judged artwork for this entry is a single PNG stored next to this
+file as ``entry.png``.  Running this program places a copy of that
+picture in the grading output directory and proves, with a SHA-256
+digest, that the bytes which landed there are exactly the bytes that
+were submitted.  Any mismatch aborts the run with a non-zero exit
+code so a corrupted or truncated copy can never pass silently.
+
+Only the Python standard library is used.
 """
 
 import hashlib
 import os
+import shutil
 import sys
+from pathlib import Path
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-SOURCE = os.path.join(HERE, "entry.png")
-EXPECTED_SHA256 = (
-    "7b87897617a942293df9bc9eb881caa8410f5f3895d6edcaad9fd91a9f373e87"
-)
-OUTPUT_DIR = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
-TARGET = os.path.join(OUTPUT_DIR, "entry.png")
+# SHA-256 of the approved entry.png, recorded when the image was
+# finalised.  The published copy must hash to this exact value.
+EXPECTED_SHA256 = "7b87897617a942293df9bc9eb881caa8410f5f3895d6edcaad9fd91a9f373e87"
 
-
-def sha256_of(data):
-    return hashlib.sha256(data).hexdigest()
+IMAGE_NAME = "entry.png"
+CHUNK = 65536
 
 
-def read_source():
-    with open(SOURCE, "rb") as fh:
-        return fh.read()
+def digest_of(path):
+    """Return the SHA-256 hex digest of the file at ``path``."""
+    hasher = hashlib.sha256()
+    with open(path, "rb") as handle:
+        while True:
+            block = handle.read(CHUNK)
+            if not block:
+                break
+            hasher.update(block)
+    return hasher.hexdigest()
+
+
+def output_directory():
+    """Where the grader expects the entry: MAKEFUN_OUTPUT_DIR or /output."""
+    chosen = os.environ.get("MAKEFUN_OUTPUT_DIR", "").strip()
+    return Path(chosen) if chosen else Path("/output")
+
+
+def fail(message, code):
+    print("error: " + message, file=sys.stderr)
+    return code
 
 
 def main():
-    data = read_source()
-    if not data:
-        print("nothing to publish: %s is empty" % SOURCE,
-              file=sys.stderr)
-        return 1
-    digest = sha256_of(data)
-    if digest != EXPECTED_SHA256:
-        print("refusing to publish: sha256 %s does not match the "
-              "recorded %s" % (digest, EXPECTED_SHA256),
-              file=sys.stderr)
-        return 1
+    here = Path(__file__).resolve().parent
+    source = here / IMAGE_NAME
+    if not source.is_file():
+        return fail("stored image missing: %s" % source, 2)
 
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    # Publish atomically rather than writing the target in place:
-    # stage the bytes in a scratch file in the same directory, flush
-    # them to disk, check what actually landed, and only then rename
-    # over the target. An interrupted run can leave a stray scratch
-    # file behind, but never a half-written entry.png.
-    scratch = TARGET + ".part"
-    with open(scratch, "wb") as fh:
-        fh.write(data)
-        fh.flush()
-        os.fsync(fh.fileno())
-    with open(scratch, "rb") as fh:
-        staged = fh.read()
-    if sha256_of(staged) != EXPECTED_SHA256:
-        print("staged copy failed verification, discarding: %s"
-              % scratch, file=sys.stderr)
-        os.unlink(scratch)
-        return 1
-    os.replace(scratch, TARGET)
+    # The stored artwork itself must match the recorded digest before
+    # anything is published; otherwise the repo contents are wrong.
+    stored_digest = digest_of(source)
+    if stored_digest != EXPECTED_SHA256:
+        return fail(
+            "stored image digest %s does not match the recorded %s"
+            % (stored_digest, EXPECTED_SHA256),
+            1,
+        )
 
-    with open(TARGET, "rb") as fh:
-        published = fh.read()
-    if sha256_of(published) != EXPECTED_SHA256:
-        print("published copy failed its read-back check: %s" % TARGET,
-              file=sys.stderr)
-        return 1
+    target_dir = output_directory()
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target = target_dir / IMAGE_NAME
 
-    print("published %s (%d bytes, sha256 %s)"
-          % (TARGET, len(published), EXPECTED_SHA256))
+    # Publish atomically: copy to a scratch file in the same directory,
+    # flush it to disk, verify its digest, and only then rename it over
+    # the final name.  An interrupted run can therefore never leave a
+    # half-written entry.png behind for the grader to pick up.
+    scratch = target_dir / (IMAGE_NAME + ".part")
+    try:
+        with open(source, "rb") as src, open(scratch, "wb") as dst:
+            shutil.copyfileobj(src, dst, CHUNK)
+            dst.flush()
+            os.fsync(dst.fileno())
+
+        published_digest = digest_of(scratch)
+        if published_digest != EXPECTED_SHA256:
+            return fail(
+                "staged copy digest %s does not match the recorded %s"
+                % (published_digest, EXPECTED_SHA256),
+                1,
+            )
+        os.replace(scratch, target)
+    finally:
+        if scratch.exists():
+            scratch.unlink()
+
+    print(published_digest)
     return 0
 
 
